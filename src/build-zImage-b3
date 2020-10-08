@@ -1,0 +1,108 @@
+#!/bin/sh
+#
+# Quick and dirty zImage kernel builder for the Excito B3
+#
+# The resulting kernel must be loaded by the preboot kernel
+# from this project.
+#
+#
+# Copyright (c) 2019 Gordon Bos <gordon@bosvangennip.nl>
+#
+#
+# License (GPL v3.0)
+# ------------------
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+SOURCEDIR="/usr/src"
+
+
+# are we running on the B3 itself or on a crossdev machine?
+MYCHOST="armv5tel-softfloat-linux-gnueabi"
+if (uname -p | grep -q "Feroceon"); then
+    MYROOT=""
+    MAKEEXTRAS=""
+else
+    MYROOT="/usr/${MYCHOST}"
+    SOURCEDIR=$(realpath "${MYROOT}/${SOURCEDIR}")
+    MAKEEXTRAS="ARCH=arm CROSS_COMPILE=armv5tel-softfloat-linux-gnueabi-"
+fi
+
+# verify that the sources are present
+if [[ ! -d "${SOURCEDIR}" ]]; then
+    echo "System source directory '${SOURCEDIR}' could not be found"
+    exit 1
+fi
+cd "${SOURCEDIR}"
+if [[ ! -d linux ]]; then
+    echo "Please install a kernel source and/or use 'eselect kernel' to mark it as current"
+    exit 1
+fi
+cd linux || exit 1
+
+# verify that the kernel is configured
+if [[ ! -s ".config" ]]; then
+    echo "Warning: kernel is not yet configured"
+    if [[ "${MYROOT}" = "" ]]; then
+        echo " - importing config from current running kernel"
+        zcat "/prog/config.gz" > ".config"
+    else
+        KERNELLIST=$(ls -r ../kernel-*/.config | sed "s/...linux-4.9.49-gentoo-r1..config//")
+        LASTCONFIG=$(echo ${KERNELLIST} | awk '{print $1}')
+        if [[ "${LASTCONFIG}" != "" ]]; then
+            OLDKERNEL=$(echo "${LASTCONFIG}" | awk -F/ '{print $2}')
+            echo " - importing config from kernel source ${OLDKERNEL}"
+            cp "${LASTCONFIG}" ".config"
+        fi
+    fi
+    if [[ ! -s ".config" ]]; then
+        echo "Error: could not find a config file to use as a starter"
+        exit 1
+    fi
+    echo " - starting menuconfig; please verify the imported kernel options"
+    sleep 3
+    make ${MAKEEXTRAS} menuconfig
+fi
+
+# build the kernel
+echo "Invoking buildkernel-b3"
+buildkernel-b3 -z
+cd - >/dev/null
+
+# cleanup the build results and rename the kernel to include its version
+cd linux/deploy_root/boot || exit 1
+rm -f *.dtb
+cp -a ../../Module.symvers .
+readonly KVERSION=$(pwd -P | awk -F/ '{print $(NF-2)}' | sed "s/^linux\-//")
+ls -1 | grep -v "${KVERSION}" | while read file; do
+    mv ${file} "${file}-${KVERSION}-b3"
+done
+mv zImage* "vmlinuz-${KVERSION}-b3" 2>/dev/null
+cd - >/dev/null
+
+cd linux/deploy_root/lib/modules/*/ || exit 1
+    readonly BUILDDIR=$(readlink build | awk -F/ '{print "/"$(NF-2)"/"$(NF-1)"/"$NF}')
+    ln -snf "${BUILDDIR}" "build"
+    ln -snf "${BUILDDIR}" "source"
+cd - >/dev/null
+
+# compress for distribution
+cd linux/deploy_root
+    echo "Saving distribution folder to ${SRCDIR}/bubba-b3-kernel-${KVERSION}.tar.xz"
+    tar -cJvf ../../bubba-b3-kernel-${KVERSION}.tar.xz *
+cd - >/dev/null
+
+echo "Done!"
+

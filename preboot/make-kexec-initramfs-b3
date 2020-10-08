@@ -1,0 +1,406 @@
+#!/bin/sh
+#
+# initramfs builder for the Excito B3 kexec kernel
+#
+#
+#
+# Copyright (c) 2019 Gordon Bos <gordon@bosvangennip.nl>
+#
+#
+# License (GPL v3.0)
+# ------------------
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+
+# where to create our initramfs content
+TARGETDIR="/usr/src/initramfs"
+
+# what partition the resulting init should mount to find and load the final kernel
+#  - when booting from the internal harddisk
+BOOT_PATH="/dev/sda1"
+#  - when booting from a USB stick
+BOOT_DESC="UUID=EED5-410D"
+
+
+
+_die() {
+    echo "Error - $*"
+    exit 1
+}
+
+# check command line options
+CMDOPTS=$(getopt -o "uh" -- $*)
+if (echo ${CMDOPTS} | grep -q "\-u"); then
+    BOOTFROM="usb"
+else
+    BOOTFROM="sda"
+fi
+
+# are we running on the B3 itself or on a crossdev machine?
+MYCHOST="armv5tel-softfloat-linux-gnueabi"
+if (uname -p | grep -q "Feroceon"); then
+    MYROOT=""
+    MYEMERGE="emerge"
+else
+    MYROOT="/usr/${MYCHOST}"
+    MYEMERGE="CHOST=\"${MYCHOST}\" cross-emerge"
+fi
+
+# verify the build capabilities of this host
+MYREADELF=$(which armv5tel-softfloat-linux-gnueabi-readelf)
+if [ -z ${MYREADELF} ]; then
+    _die "this host cannot create binaries for Excito B3"
+fi
+
+# try to locate kexec and busybox on this machine and verify that they are statically linked
+_findexe() {
+    ls ${MYROOT}/bin/$1 ${MYROOT}/sbin/$1 ${MYROOT}/usr/bin/$1 ${MYROOT}/usr/sbin/$1 2>/dev/null | awk '{print $1}'
+}
+
+MYKEXEC=$(_findexe kexec)
+if [ -z ${MYKEXEC} ]; then
+    echo "WARNING - kexec not found"
+else
+    if (${MYREADELF} --dyn-syms ${MYKEXEC} | grep -q FUNC); then
+        echo "WARNING - installed version of kexec uses dynamic linking"
+        MYKEXEC=""
+    fi
+fi
+
+MYBBOX=$(_findexe busybox)
+if [ -z ${MYBBOX} ]; then
+    echo "WARNING - busybox not found"
+else
+    if (${MYREADELF} --dyn-syms ${MYBBOX} | grep -q FUNC); then
+        echo "WARNING - installed version of busybox uses dynamic linking"
+        MYBBOX=""
+    fi
+fi
+
+# all checks complete
+
+
+# change to our target directory
+if (echo ${TARGETDIR} | grep -q "^/"); then
+    mkdir -p ${MYROOT}${TARGETDIR}
+    pushd ${MYROOT}${TARGETDIR} > /dev/null || _die "failed changing to target directory"
+else
+    mkdir -p ${TARGETDIR}
+    pushd ${TARGETDIR} > /dev/null || _die "failed changing to target directory"
+fi
+echo " * changed to target directory $(pwd)"
+
+# verify current content of the target directory
+if (ls -1 | grep -q "."); then
+    # target directory is not empty
+    if (find -type f | grep -qv "init\|kexec\|busybox"); then
+        popd > /dev/null
+        _die "target directory contains unexpected files - bailing out"
+    fi
+    echo " * clearing old content from the target directory"
+    rm -rf *
+fi
+
+echo " * creating a basic root directory structure"
+DIRS="bin boot dev/pts etc lib mnt proc root sbin sys tmp"
+for folder in ${DIRS}; do
+    mkdir -p ${folder}
+done
+
+
+echo " * creating dev nodes"
+UMASKSAVE=$(umask)
+umask 0177
+mknod dev/console c 5 1
+
+umask 0333
+mknod dev/random  c 1 8
+mknod dev/urandom c 1 9
+
+umask 0133
+mknod dev/null    c 1 3
+mknod dev/zero    c 1 5
+mknod dev/tty     c 5 0
+mknod dev/ptmx    c 5 2
+
+umask 0137
+mknod dev/sda  b 8 0
+mknod dev/sda1 b 8 1
+mknod dev/sda2 b 8 2
+mknod dev/sda3 b 8 3
+mknod dev/sdb  b 8 16
+mknod dev/sdb1 b 8 17
+mknod dev/sdb2 b 8 18
+mknod dev/sdb3 b 8 19
+
+umask ${UMASKSAVE}
+
+
+
+
+# copy kexec and busybox to our target directory - build packages if needed
+_extract_kexec() {
+    MYKEXEC=$(tar --list -f ${MYPKGDIR}/sys-apps/kexec-tools*.tbz2 2>/dev/null | grep bin/kexec)
+    tar --transform="s/^.*$/sbin\/kexec/" -xf ${MYPKGDIR}/sys-apps/kexec-tools*.tbz2 ${MYKEXEC} 2>/dev/null
+}
+
+if [ -z ${MYKEXEC} ]; then
+    MYPKGDIR="${MYROOT}/root/static-packages"
+    mkdir -p ${MYPKGDIR}
+    if [ -f ${MYPKGDIR}/sys-apps/kexec-tools*.tbz2 ]; then
+        echo -n " * verifying prebuilt kexec package"
+        # extract binary from archive
+        _extract_kexec
+        if (${MYREADELF} --dyn-syms sbin/kexec | grep -q FUNC); then
+            echo " -> Fail"
+            MYKEXEC=""
+            rm sbin/kexec
+        else
+            echo " -> OK"
+        fi
+    fi
+
+    if [ -z ${MYKEXEC} ]; then
+        echo " * building static version of kexec"
+        eval PKGDIR=\"${MYPKGDIR}\" \
+            LDFLAGS=\"-static\" \
+            ACCEPT_KEYWORDS=\"amd64\" \
+            ${MYEMERGE} --ask --oneshot --nodeps --buildpkgonly kexec-tools || _die "build of kexec failed"
+
+        # extract binary from archive
+        _extract_kexec
+    fi
+else
+    cp -a ${MYKEXEC} sbin/
+fi
+echo " * kexec copied to target"
+
+_extract_busybox() {
+    MYBBOX=$(tar --list -f ${MYPKGDIR}/sys-apps/busybox*.tbz2  2>/dev/null | grep bin/busybox)
+    tar --transform="s/^.*$/bin\/busybox/" -xf ${MYPKGDIR}/sys-apps/busybox*.tbz2 ${MYBBOX} 2>/dev/null
+}
+
+if [ -z ${MYBBOX} ]; then
+    MYPKGDIR="${MYROOT}/root/static-packages"
+    mkdir -p ${MYPKGDIR}
+    if [ -f ${MYPKGDIR}/sys-apps/busybox*.tbz2 ]; then
+        echo -n " * verifying prebuilt busybox package"
+        # extract binary from archive
+        _extract_busybox
+        if (${MYREADELF} --dyn-syms bin/busybox | grep -q FUNC); then
+            echo " -> Fail"
+            MYBBOX=""
+            rm bin/busybox
+        else
+            echo " -> OK"
+        fi
+    fi
+
+    if [ -z ${MYBBOX} ]; then
+        echo " * building static version of busybox"
+        eval PKGDIR=\"${MYPKGDIR}\" \
+            USE=\"-ipv6 static\" \
+            ${MYEMERGE} --oneshot --nodeps --buildpkgonly busybox || _die "build of busybox failed"
+
+        # extract binary from archive
+        _extract_busybox
+    fi
+else
+    cp -a ${MYBBOX} bin/
+fi
+echo " * busybox copied to target"
+
+
+echo " * creating direct access command symlinks towards busybox"
+BB_BIN="ash cat cp dos2unix echo false ls mount mv rm sh sleep sync true umount"
+BB_SBIN="blkid fdisk findfs fsck ifconfig mdev swapoff swapon"
+
+for link in ${BB_BIN}; do
+    ln -sr bin/busybox bin/${link}
+done
+
+for link in ${BB_SBIN}; do
+    ln -sr bin/busybox sbin/${link}
+done
+
+
+echo " * writing init file"
+cat > init << EOF
+#!/bin/sh
+# simple init script to kexec the final target kernel
+# starts recovery console on error
+
+# BOOT_PATH should be either "${BOOT_PATH}" for locating the final kernel on
+# the hard drive or "${BOOT_DESC}" if we want to use our USB image
+BOOT_PATH="${BOOT_PATH}"
+
+# optional delay if boot path does not come up directly after starting udev
+# this is always triggered when we boot from USB
+UDEVDELAY=5
+
+# declare defaults for variables settable in boot.ini
+ROOT="/dev/sda3"
+ROOTFS="ext4"
+ROOTDELAY=0
+LED="purple"
+INIT="openrc"
+CONSOLE="console=ttyS0,115200n8"
+SYSTEMDPATH="/usr/lib/systemd"
+DTB="kirkwood-b3-\${LED}.dtb"
+EXTRAPARMS=""
+KERNEL=""
+
+
+error_exit() {
+    # turn led red to show error state
+    echo -n 0 > /sys/class/leds/bubba3\\:green\\:programming/brightness
+    echo -n 0 > /sys/class/leds/bubba3\\:blue\\:active/brightness
+    cat /sys/class/leds/bubba3\\:red\\:error/max_brightness > \\
+        /sys/class/leds/bubba3\\:red\\:error/brightness
+    echo "Starting recovery shell on serial console..." >&2
+    exec /bin/sh -i
+}
+
+# mount pseudo filesystems.
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devpts none /dev/pts
+
+
+# start udev
+echo "/sbin/mdev" > /proc/sys/kernel/hotplug
+mdev -s
+if [ ! -b "\${BOOT_PATH}" ]; then
+    sleep "\${UDEVDELAY}"
+fi
+
+if [ -b "\${BOOT_PATH}" ]; then
+    BOOT_DESC="\${BOOT_PATH}"
+    echo "Trying to locate partition \${BOOT_DESC}..."
+    if ! BOOT_PATH="\$(findfs "\${BOOT_DESC}")"; then
+        echo "Error - could not find \${BOOT_DESC}!" >&2
+        error_exit
+    fi
+fi
+
+
+echo "Mounting boot filesystem (read only)..."
+if ! mount -o ro "\${BOOT_PATH}" /boot; then
+    echo "Error - failed to mount \${BOOT_PATH}!" >&2
+    error_exit
+fi
+
+
+# import boot.ini settings
+source /boot/boot.ini
+
+
+# construct kernel command line from ini settings
+CMDLINE="root=\${ROOT} rootfstype=\${ROOTFS}"
+if [ ! -z "\${ROOTDELAY}" ]; then
+    if [ "\${ROOTDELAY}" != "0" ]; then
+        CMDLINE="\${CMDLINE} rootdelay=\${ROOTDELAY}"
+    fi
+fi
+CMDLINE="\${CMDLINE} \${CONSOLE} earlyprintk"
+if [ "\${INIT}" == "systemd" ]; then
+    CMDLINE="\${CMDLINE} init=\${SYSTEMDPATH}/systemd"
+fi
+CMDLINE="\${CMDLINE} \${EXTRAPARMS}"
+
+
+# tweak:
+# need to initialize the NICs or they will have mac 00:00:00:00:00:00 in
+# the final kernel and cannot be used
+ifconfig eth0 127.0.0.100 netmask 255.255.255.255
+ifconfig eth1 127.0.0.200 netmask 255.255.255.255
+
+
+# auto select kernel if none is specified
+if [ -z "\${KERNEL}" ]; then
+    cd boot
+    KERNEL=\$(ls -1t vmlinuz* 2>/dev/null| sed -n 1p)
+    cd /
+fi
+if [ -z "\${KERNEL}" ]; then
+    echo "Error - can't find any kernel to load!" >&2
+    error_exit
+fi
+if [ ! -f "/boot/\${KERNEL}" ]; then
+    echo "Error - kernel does not exist!" >&2
+    error_exit
+fi
+
+# select device tree blob
+if [ -f "/boot/firmware/kirkwood-b3-\${LED}.dtb" ]; then
+    DTB="kirkwood-b3-\${LED}.dtb"
+else
+    if [ "\${LED}" == "off" ]; then
+        DTB="kirkwood-b3.dtb"
+    fi
+fi
+if [ ! -f "/boot/firmware/\${DTB}" ]; then
+    echo "Error - device tree blob is missing!" >&2
+    error_exit
+fi
+
+
+# per https://lists.debian.org/debian-boot/2012/08/msg00804.html
+echo -n -e \\\\x11\\\\x3f\\\\x3f\\\\xee >  /tmp/cache_head_patch
+echo -n -e \\\\x01\\\\x35\\\\xc3\\\\xe3 >> /tmp/cache_head_patch
+echo -n -e \\\\x11\\\\x3f\\\\x2f\\\\xee >> /tmp/cache_head_patch
+echo -n -e \\\\x00\\\\x30\\\\xa0\\\\xe3 >> /tmp/cache_head_patch
+echo -n -e \\\\x17\\\\x3f\\\\x07\\\\xee >> /tmp/cache_head_patch
+cat /tmp/cache_head_patch /boot/\${KERNEL} > /tmp/\${KERNEL}
+
+kexec --type=zImage --dtb="/boot/firmware/\${DTB}" --command-line="\${CMDLINE}" \\
+      --load /tmp/\${KERNEL}
+
+umount /boot
+
+kexec -e
+
+# kexec failed
+echo "Error - kexec has returned!" >&2
+error_exit
+EOF
+# end of init script
+
+echo "done!"
+echo
+
+# make sure that the correct boot partition gets mounted by the bootloader
+if [ ${BOOTFROM} == "usb" ]; then
+    sed -e "/^BOOT_PATH/cBOOT_PATH=\"${BOOT_DESC}\"" -e "s/^ROOTDELAY=0/ROOTDELAY=5/" -i init
+    cat << EOF
+Note: this initramfs was configured to locate the boot partition by its
+property '${BOOT_DESC}'. Please verify that this is in fact the partition
+where you want to find the actual kernel
+EOF
+else
+    cat << EOF
+Note: this initramfs was configured to use the first hard drive partition 
+to find the actual kernel. Should you want to boot from USB then please
+rerun this script with parameter '-u'
+EOF
+fi
+
+# make init executable
+chmod +x init
+
+# cleanup
+popd > /dev/null
+

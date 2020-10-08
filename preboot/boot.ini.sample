@@ -1,0 +1,33 @@
+# specify the root partition (default: /dev/sda3)
+# because /dev/sd? targets are assigned in the order that they are
+# discovered it is advised that you use PARTUUIDs if you have multiple
+# (external) disks or other storage media attached.
+# to find the PARTUUID for your disk you can use `blkid`
+#ROOT="/dev/sda3"
+
+# specify the root file system type (default: ext4)
+#ROOTFS="ext4"
+
+# when root is on USB attached media you should enable this delay
+#ROOTDELAY=5
+
+# what colour should the front led be during boot (default: purple)
+# supported values are "purple", "green" and "off"
+#LED="purple"
+
+# enable this to boot into systemd service manager (default: openrc)
+#INIT="systemd"
+
+# which kernel to load (default: empty, autodetect)
+# the default autodetect method searches boot for kernels matching
+# filemask vmlinuz*, selecting the one that has the most recent
+# modification date.
+#KERNEL="vmlinuz-4.9.49-gentoo-r1-b3"
+
+
+# advanced - directly set target values
+#DTB="kirkwood-b3-purple.dtb"
+#CONSOLE="console=ttyS0,115200n8"
+#SYSTEMDPATH="/usr/lib/systemd"
+#EXTRAPARMS=""
+

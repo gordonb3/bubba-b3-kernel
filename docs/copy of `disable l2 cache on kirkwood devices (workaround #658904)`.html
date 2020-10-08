@@ -1,0 +1,170 @@
+<!-- MHonArc v2.6.19 -->
+<!--X-Subject: disable l2 cache on kirkwood devices (workaround #658904) -->
+<!--X-From-R13: Wna Qnzcoryy &#60;vwpNuryyvba.bet.hx> -->
+<!--X-Date: Thu, 30 Aug 2012 09:36:58 +0000 (UTC) -->
+<!--X-Message-Id: 1346319361.27277.52.camel@zakaz.uk.xensource.com -->
+<!--X-Content-Type: text/plain -->
+<!--X-Head-End-->
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"
+        "http://www.w3.org/TR/html4/loose.dtd">
+<html>
+<head>
+<title>disable l2 cache on kirkwood devices (workaround #658904)</title>
+<link rev="made" href="mailto:ijc@hellion.org.uk">
+<link rel="index" href="mail2.html">
+<link rel="top" href="thrd2.html">
+<link rel="up" href="msg00804.html">
+<link rel="prev" href="msg00808.html">
+<link rel="next" href="msg00805.html">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+pre {
+  white-space: pre-wrap;
+}
+</style>
+</head>
+<body>
+<!--X-Body-Begin-->
+<!--X-User-Header-->
+<!--X-User-Header-End-->
+<!--X-TopPNI-->
+<hr>
+<form method="POST" action="/cgi-bin/spam-report.pl">
+<input type="hidden" name="listname" value="debian-boot" />
+<input type="hidden" name="msg" value="msg00804.html" />
+<input type="hidden" name="date" value="2012/08" />
+<input type="submit" value="Report as spam" style="float: right"  />
+
+[<a href="msg00803.html">Date Prev</a>][<a href="msg00805.html">Date Next</a>]
+[<a href="msg00808.html">Thread Prev</a>][<a href="msg00805.html">Thread Next</a>]
+[<a href="mail2.html#00804">Date Index</a>]
+[<a href="thrd2.html#00804">Thread Index</a>]
+</form>
+
+
+<!--X-TopPNI-End-->
+<!--X-MsgBody-->
+<!--X-Subject-Header-Begin-->
+<h1>disable l2 cache on kirkwood devices (workaround #658904)</h1>
+<hr>
+<!--X-Subject-Header-End-->
+<!--X-Head-of-Message-->
+<ul>
+<li><em>To</em>: <a href="mailto:debian-arm%40lists.debian.org">debian-arm@lists.debian.org</a>, <a href="mailto:debian-boot%40lists.debian.org">debian-boot@lists.debian.org</a>, 	<a href="mailto:debian-kernel%40lists.debian.org">debian-kernel@lists.debian.org</a></li>
+<li><em>Subject</em>: disable l2 cache on kirkwood devices (workaround #658904)</li>
+<li><em>From</em>: Ian Campbell &lt;<a href="mailto:ijc%40hellion.org.uk">ijc@hellion.org.uk</a>&gt;</li>
+<li><em>Date</em>: Thu, 30 Aug 2012 10:36:01 +0100</li>
+<li><em>Message-id</em>: &lt;<A HREF="/msgid-search/1346319361.27277.52.camel@zakaz.uk.xensource.com">[&#128270;]</a>&nbsp;<a href="msg00804.html">1346319361.27277.52.camel@zakaz.uk.xensource.com</A>&gt;</li>
+</ul>
+<!--X-Head-of-Message-End-->
+<!--X-Head-Body-Sep-Begin-->
+<hr>
+<!--X-Head-Body-Sep-End-->
+<!--X-Body-of-Message-->
+<pre>A while back a bug was discovered in u-boot on the kirkwood platform
+which prevented modern kernels from booting[0]. Specifically u-boot was
+failing to disable the L2 cache which interacts badly with kernels using
+CONFIG_ARM_PATCH_PHYS_VIRT. CONFIG_ARM_PATCH_PHYS_VIRT relates to
+running a single kernel image on multiple machines and so disabling it
+was not really an option.
+
+It's not immediately obvious which kirkwood platforms are effected,
+since the only real way to tell is to try it (since the u-boot shipped
+by the factory on these boards are many and varied). From the bug
+reports we know that Dockstar, Shivaplug, Gruruplug and Dreamplug have
+this issue. I've got a QNAP device which I indend to try as soon as I
+can solder a serial console together[1].
+
+u-boot has been fixed and the fix is available in Wheezy. However not
+all kirkwood platforms have a serial console or a JTAG port so there is
+a chance that upgrade will either brick the board (due to a botched
+u-boot upgrade) or fail to boot the new kernel with no easy way to
+recover (due to a lack of serial console to roll back).
+
+I've just tried injecting the following onto the head of the zImage (in
+a similar manner to flash-kernel's set_machine_id function):
+        # disable l2 caches
+        devio &quot;wl 0xee3f3f11,4&quot; # mrc 15, 1, r3, cr15, cr1, {0}
+        devio &quot;wl 0xe3c33501,4&quot; # bic r3, r3, #0x400000
+        devio &quot;wl 0xee2f3f11,4&quot; # mcr 15, 1, r3, cr15, cr1, {0}
+        
+        # flush caches
+        devio &quot;wl 0xe3a03000,4&quot; # mov r3, #0
+        devio &quot;wl 0xee073f17,4&quot; # mcr 15, 0, r3, cr7, cr7, {0}
+This works around the issue on my dreamplug (this is effectively the
+same code sequence as what the u-boot fix does).
+
+I can see two ways of distributing this fix. Either a kernel patch gated
+on CONFIG_ARCH_KIRKWOOD to some early bit of code or use devio in
+flash-kernel + the installer build.
+
+If it's to be flash kernel then I suppose gating on the kernel flavour =
+&quot;kirkwood&quot; would be wise, but we could also gate on a per machine basis.
+In this case we would also need to duplicate the injection in the
+installer build.
+
+My only concern is whether this code sequence is valid on all the
+kirkwood platforms which we support. I'd like to assume that the
+processors were all similar enough but I don't really know.
+
+Anybody have any thoughts on the best way to go about this or the sanity
+of the approach generally?
+
+Ian.
+
+[0]
+ - <a  rel="nofollow" href="http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=658904">http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=658904</a>
+ - <a  rel="nofollow" href="http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=658759">http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=658759</a>
+ - <a  rel="nofollow" href="http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=685713">http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=685713</a>
+[1] Not a skill which I am renowned for possessing, so we'll see when
+that actually happens ;-)
+-- 
+Ian Campbell
+Current Noise: Anathema - Lightning Song
+
+ any new sendmail hole I have to fix before going on vacations?
+		-- Seen on #Linux
+
+</pre>
+<!--X-Body-of-Message-End-->
+<!--X-MsgBody-End-->
+<!--X-Follow-Ups-->
+<hr />
+<strong>Reply to:</strong>
+<ul>
+  <li><a href="mailto:debian-boot&#64;lists.debian.org?in-reply-to=&lt;1346319361.27277.52.camel@zakaz.uk.xensource.com&gt;&amp;subject=Re:%20disable l2 cache on kirkwood devices (workaround #658904)">debian-boot&#64;lists.debian.org</a></li>
+  <li><a href="mailto:ijc@hellion.org.uk?in-reply-to=&lt;1346319361.27277.52.camel@zakaz.uk.xensource.com&gt;&amp;subject=Re:%20disable l2 cache on kirkwood devices (workaround #658904)&amp;cc=debian-boot&#64;lists.debian.org">Ian Campbell (on-list)</a></li>
+  <li><a href="mailto:ijc@hellion.org.uk?in-reply-to=&lt;1346319361.27277.52.camel@zakaz.uk.xensource.com&gt;&amp;subject=Re:%20disable l2 cache on kirkwood devices (workaround #658904)">Ian Campbell (off-list)</a></li>
+</ul>
+<hr />
+<!--X-Follow-Ups-End-->
+<!--X-References-->
+<!--X-References-End-->
+<!--X-BotPNI-->
+<ul>
+<li>Prev by Date:
+<strong><a href="msg00803.html">Bug#686226: [FATAL] Wheezy Debian installer fails on Qosmio hardware</a></strong>
+</li>
+<li>Next by Date:
+<strong><a href="msg00805.html">Install Debian Squeeze on Alix 2d2 over Serial Console</a></strong>
+</li>
+<li>Previous by thread:
+<strong><a href="msg00808.html">Bug#686226: marked as done ([FATAL] Wheezy Debian installer fails on	Qosmio hardware)</a></strong>
+</li>
+<li>Next by thread:
+<strong><a href="msg00805.html">Install Debian Squeeze on Alix 2d2 over Serial Console</a></strong>
+</li>
+<li>Index(es):
+<ul>
+<li><a href="mail2.html#00804"><strong>Date</strong></a></li>
+<li><a href="thrd2.html#00804"><strong>Thread</strong></a></li>
+</ul>
+</li>
+</ul>
+
+<!--X-BotPNI-End-->
+<!--X-User-Footer-->
+<!--X-User-Footer-End-->
+</body>
+</html>
+

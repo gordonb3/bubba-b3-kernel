@@ -1,0 +1,478 @@
+#!/bin/bash
+#
+# Adapted version of the buildkernel-b3 script by Sakaki 
+#
+# This script has the sole purpose of creating a preboot
+# uImage (or itb) kernel. 
+#
+# Copyright (c) 2019 Gordon Bos <gordon@bosvangennip.nl>
+#
+# =======================================================
+#
+# Build a bootable kernel for the Excito B3 miniserver.
+#
+# Please see the accompanying manpage for details.
+#
+# Copyright (c) 2015-17 sakaki <sakaki@deciban.com>
+#
+# License (GPL v3.0)
+# ------------------
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+set -e
+set -u
+shopt -s nullglob
+
+
+# settings
+KNAME="B3 minimal kexec"
+KERNEL=linux-4.9.49-gentoo-r1
+INITRAMFS=initramfs
+FIRMWAREPATH=firmware
+UUID=EED5-410D
+
+
+
+# Scroll to the bottom of this script to follow the main program flow.
+
+# ********************** variables ********************* 
+PROGNAME="$(basename "${0}")"
+VERSION="1.0.6"
+RED_TEXT="" GREEN_TEXT="" YELLOW_TEXT="" RESET_ATTS=""
+if [[ -v TERM && -n "${TERM}" && "${TERM}" != "dumb" ]]; then
+    RED_TEXT="$(tput setaf 1)$(tput bold)"
+    GREEN_TEXT="$(tput setaf 2)$(tput bold)"
+    YELLOW_TEXT="$(tput setaf 3)$(tput bold)"
+    RESET_ATTS="$(tput sgr0)"
+fi
+VERBOSITY=1
+VERBOSITYFLAG=""
+PREFIXSTRING="* "
+SHOWPREFIX="${GREEN_TEXT}${PREFIXSTRING}${RESET_ATTS}"
+SHOWSUFFIX=""
+BOOTMOUNT="/boot"
+INSTALLDIR="/install"
+BOOTDIR="/boot"
+LIBDIR="/lib"
+B3CPU="88FR131"
+NUMTHREADS=$(( $(nproc) + 1 ))
+CUSTOMDTSPATH=""
+DTSNAME="kirkwood-b3.dts"
+DTSPATH="arch/arm/boot/dts/${DTSNAME}"
+DTSOLDPATH="${DTSPATH}.orig"
+KVERSION=$(echo ${KERNEL} | sed "s/^linux\-//")
+DEPLOYROOT="deploy_root"
+MINSTALLEXTRAS="INSTALL_MOD_PATH=${DEPLOYROOT}"
+DTSGREEN="kirkwood-b3-green.dts"
+DTSPURPLE="kirkwood-b3-purple.dts"
+
+
+# building on B3 (=1) or cross-compiling (=0)?
+declare -i NATIVE_BUILD=0
+
+# program arguments (booleans in this case)
+declare -i ARG_HELP=0 ARG_VERBOSE=0 ARG_VERSION=0 ARG_USB_BUILD=0 ARG_CLEAN=0
+declare -i ARG_MENUCONFIG=0
+
+# ***************** various functions ****************** 
+cleanup_and_exit_with_code() {
+    if [[ -s "${DTSOLDPATH}" ]]; then
+        show "Restoring original DTS..."
+        cp -v "${DTSOLDPATH}" "${DTSPATH}"
+        rm -f "${DTSOLDPATH}"
+    fi
+    # add any additional cleanup code here
+    set +e
+    trap - EXIT
+    exit $1
+}
+fn_exists() {
+    declare -f -F "${1}" > /dev/null
+    return $?
+}
+show() {
+    local MESSAGE=${1:-""}
+    local VERBLEVEL=${2:-${VERBOSITY}}
+    if (( VERBLEVEL >=1 )); then
+        echo -e "${SHOWPREFIX}${MESSAGE}${SHOWSUFFIX}"
+    fi
+}
+warning() {
+    echo -e "${YELLOW_TEXT}${PREFIXSTRING}${RESET_ATTS}${PROGNAME}: Warning: ${1}" >&2
+}
+die() {
+    echo
+    echo -e "${RED_TEXT}${PREFIXSTRING}${RESET_ATTS}${PROGNAME}: Error: ${1} - exiting" >&2
+    cleanup_and_exit_with_code 1
+}
+trap_cleanup() {
+    trap - SIGHUP SIGQUIT SIGINT SIGTERM SIGKILL EXIT
+    die "Caught signal"
+}
+trap trap_cleanup SIGHUP SIGQUIT SIGINT SIGTERM SIGKILL EXIT
+test_yn() {
+    echo -n -e "${SHOWPREFIX}${1} (y/n)? ${SHOWSUFFIX}"
+    read -r -n 1
+    echo
+    if [[ ${REPLY} =~ ^[Yy]$ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+test_yn_need_enter() {
+    echo -n -e "${SHOWPREFIX}${1} (y/n)? ${SHOWSUFFIX}"
+    read -r
+    echo
+    if [[ ${REPLY} =~ ^[Yy]$ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+continue_yn() {
+    if ! test_yn "${1}"; then
+        echo -e "${RED_TEXT}${PREFIXSTRING}${RESET_ATTS}Quitting" >&2
+        cleanup_and_exit_with_code 1
+    fi
+}
+check_file_exists() {
+    if [ ! -f "${1}" ]; then
+        die "File '${1}' does not exist"
+    fi
+}
+
+display_final_status() {
+    show "All done!"
+}
+if_option_set() {
+    # execute second argument as function if variable named by the first
+    # argument has value 1
+    if_option_has_value 1 "${@}"
+}
+if_option_unset() {
+    # execute second argument as function if variable named by the first
+    # argument has value 0
+    if_option_has_value 0 "${@}"
+}
+print_usage() {
+    cat << EOF
+Usage: ${PROGNAME} [options]
+
+Options:
+  -c, --clean           do a make clean at the beginning of kernel build
+  -d, --custom-dts      specify custom device tree source file to use
+  -h, --help            show this help message and exit
+  -m, --menuconfig      open kernel configuration GUI during build
+  -u, --usb             build a USB-bootable FIT image (install.itb),
+                        rather than the default uImage
+  -v, --verbose         display more information, where possible
+  -V, --version         display the version number of ${PROGNAME} and exit
+EOF
+}
+print_help() {
+    cat << EOF
+${PROGNAME} - build a bootable kernel for the Excito B3 miniserver
+EOF
+    print_usage
+}
+print_version() {
+    printf "%s\n" "${VERSION}"
+}
+display_usage_message_and_bail_out() {
+    if [ ! -z "${1+x}" ]; then
+        printf "%s: %s\n" "${PROGNAME}" "${1}" >&2
+    fi
+    print_usage >&2
+    cleanup_and_exit_with_code 1
+}
+internal_consistency_option_checks() {
+    if [[ -n "${CUSTOMDTSPATH}" ]]; then
+        CUSTOMDTSPATH="$(realpath "${CUSTOMDTSPATH}")"
+        if [[ ! -f "${CUSTOMDTSPATH}" ]]; then
+            die "Custom DTS file '${CUSTOMDTSPATH}' not found"
+        fi
+    fi
+}
+setup_final_variables() {
+    DTBNAME=${DTSNAME/.dts/.dtb}
+    DTBGREEN=${DTSGREEN/.dts/.dtb}
+    DTBPURPLE=${DTSPURPLE/.dts/.dtb}
+    if grep -qsi "${B3CPU}" /proc/cpuinfo; then
+        NATIVE_BUILD=1
+        MAKEEXTRAS=""
+        SRCDIR=/usr/src
+    else
+        MAKEEXTRAS="ARCH=arm CROSS_COMPILE=armv5tel-softfloat-linux-gnueabi-"
+        SRCDIR=/usr/armv5tel-softfloat-linux-gnueabi/usr/src
+    fi
+    TGTDIR="${DEPLOYROOT}${BOOTMOUNT}"
+    if ((ARG_USB_BUILD==1)); then
+        TGTDIR+="${INSTALLDIR}"
+    else
+        TGTDIR+="${BOOTDIR}"
+    fi
+    if [[ -d "${FIRMWAREPATH}" ]]; then
+        FIRMWAREPATH=$(realpath ${FIRMWAREPATH})
+    elif [[ -d "${SRCDIR}/${FIRMWAREPATH}" ]]; then
+        FIRMWAREPATH=$(realpath ${SRCDIR}/${FIRMWAREPATH})
+    else
+        die "Firmware path '${FIRMWAREPATH}' does not exist"
+    fi
+}
+process_command_line_options() {
+    local TEMP
+    declare -i RC
+    set +e
+        # error trapping off, as we want to handle errors
+        TEMP="$(getopt -o cd:hmnuvVz --long clean,custom-dts:,help,menuconfig,usb,verbose,version,zimage -n "${PROGNAME}" -- "${@}")"
+        RC="${?}"
+    set -e
+    if ((RC!=0)); then
+        display_usage_message_and_bail_out
+    fi
+    eval set -- "${TEMP}"
+
+    # extract options and their arguments into variables.
+    while true ; do
+        case "${1}" in
+            -c|--clean) ARG_CLEAN=1 ; shift ;;
+            -d|--custom-dts)
+                case "${2}" in
+                    "") shift 2 ;;
+                    *) CUSTOMDTSPATH="${2}" ; shift 2 ;;
+                esac ;;
+            -h|--help) ARG_HELP=1 ; shift ;;
+            -m|--menuconfig) ARG_MENUCONFIG=1 ; shift ;;
+            -u|--usb) ARG_USB_BUILD=1 ; shift ;;
+            -v|--verbose) ARG_VERBOSE=1 ; shift ;;
+            -V|--version) ARG_VERSION=1 ; shift ;;
+            --) shift ; break ;;
+            *) die "Internal error!" ;;
+        esac
+    done
+    # set verbosity
+    if ((ARG_VERBOSE==1)); then
+        VERBOSITY+=1
+    fi
+    if ((VERBOSITY>1)); then
+        VERBOSITYFLAG="--verbose"
+    fi
+    internal_consistency_option_checks
+    # process 'perform-then-exit' options
+    if ((ARG_HELP==1)); then
+        print_help
+        cleanup_and_exit_with_code 0
+    elif ((ARG_VERSION==1)); then
+        print_version
+        cleanup_and_exit_with_code 0
+    fi
+    setup_final_variables
+}
+setup_deploy_root() {
+        if [ ! -d "${DEPLOYROOT}" ]; then
+            show "Creating directory: ${DEPLOYROOT}"
+            mkdir "${DEPLOYROOT}"
+        else
+            show "Cleaning prior ${DEPLOYROOT}..."
+            for NEXTDIR in ${BOOTMOUNT} ${INSTALLDIR} ${LIBDIR}; do
+                if [ -d "${DEPLOYROOT}${NEXTDIR}" ]; then
+                    rm -rf "${DEPLOYROOT}${NEXTDIR}"
+                fi
+            done
+        fi
+	mkdir -p ${DEPLOYROOT}/${BOOTMOUNT}/firmware
+}
+build_kernel() {
+    # build the raw kernel - this will be post-processed differently
+    # depending on whether we have a disk or USB boot target
+    show "Compiling kernel (${KVERSION})..."
+    if ((ARG_CLEAN==1)); then
+        show "(beginning with a make clean...)"
+        # not mrproper - so our .config file
+        # will be left alone
+        make ${MAKEEXTRAS} clean
+    fi
+    if ((ARG_MENUCONFIG==1)); then
+        show "Invoking menuconfig; select the kernel options you require..."
+        make ${MAKEEXTRAS} menuconfig
+    fi
+    make -j${NUMTHREADS} ${MAKEEXTRAS} zImage
+    # if we have a custom version, take appropriate action...
+    if [[ -s "${DTSOLDPATH}" ]]; then
+        warning "File '${DTSOLDPATH}' exists, retaining..."
+    else
+        show "Backing up existing DTS..."
+        cp -v "${DTSPATH}" "${DTSOLDPATH}"
+    fi
+    if [[ -n "${CUSTOMDTSPATH}" ]]; then
+        show "Overwriting DTS with custom version provided..."
+        cp -v  "${CUSTOMDTSPATH}" "${DTSPATH}"
+    elif ((ARG_USB_BUILD==1)); then
+        show "Using ${DTSGREEN%.dts} DTS"
+        cp -v  "${FIRMWAREPATH}/${DTSGREEN}" "${DTSPATH}"
+    else
+        show "Using ${DTSPURPLE%.dts} DTS"
+        cp -v  "${FIRMWAREPATH}/${DTSPURPLE}" "${DTSPATH}"
+    fi
+    show "Compiling DTB..."
+    make ${MAKEEXTRAS} "${DTBNAME}"
+    show "Kernel built successfully!"
+}
+create_patched_uimage() {
+    show "Creating patched zImage for B3 (caches off, DTB appended)..."
+    pushd arch/arm/boot
+    # per https://lists.debian.org/debian-boot/2012/08/msg00804.html
+    echo -n -e \\x11\\x3f\\x3f\\xee >  cache_head_patch
+    echo -n -e \\x01\\x35\\xc3\\xe3 >> cache_head_patch
+    echo -n -e \\x11\\x3f\\x2f\\xee >> cache_head_patch
+    echo -n -e \\x00\\x30\\xa0\\xe3 >> cache_head_patch
+    echo -n -e \\x17\\x3f\\x07\\xee >> cache_head_patch
+    cat cache_head_patch zImage "dts/${DTBNAME}" > zImage-dts-appended
+    rm cache_head_patch
+    show "Creating a uImage from this, targeting 0x00008000..."
+    mkimage -A arm -O linux -T kernel -C none -a 0x00008000 -e 0x00008000 \
+      -n "${KNAME}" -d zImage-dts-appended ../../../uImage
+    rm zImage-dts-appended
+    popd
+}
+create_bootable_disk_image() {
+    declare -i UIMLEN UBOOTLOAD KERNLENLOC KERNELLEN
+    local NEXTFILE IMAGE_SOURCE IMAGE_TARGET
+    create_patched_uimage
+    IMAGE_SOURCE="uImage"
+    IMAGE_TARGET="uImage"
+    show "Copying ${IMAGE_TARGET}, DTB, System.map, and config to ${TGTDIR}..."
+    mkdir -p "${TGTDIR}"
+    # make backups first
+    for NEXTFILE in "${IMAGE_TARGET}" "${DTBNAME}" System.map config; do
+        if [ -s "${TGTDIR}/${NEXTFILE}" ]; then
+            mv "${TGTDIR}/${NEXTFILE}" "${TGTDIR}/${NEXTFILE}.old"
+        fi
+    done
+    cp "${IMAGE_SOURCE}" "${TGTDIR}/${IMAGE_TARGET}"
+    cp System.map "${TGTDIR}/System.map"
+    cp .config "${TGTDIR}/config"
+}
+create_bootable_usb_image() {
+    local NEXTFILE
+    KNAME="${KNAME} (itb)"
+    create_patched_uimage
+    show "Copying install.itb, System.map and config to ${TGTDIR}..."
+    mkdir -p "${TGTDIR}"
+    for NEXTFILE in install.itb System.map config; do
+        if [ -s "${TGTDIR}/${NEXTFILE}" ]; then
+            mv "${TGTDIR}/${NEXTFILE}" "${TGTDIR}/${NEXTFILE}.old"
+        fi
+    done
+    cp uImage "${TGTDIR}/install.itb" # U-Boot will accept this
+    cp System.map "${TGTDIR}/System.map"
+    cp .config "${TGTDIR}/config"
+}
+create_alternate_dtbs() {
+    show "Creating DTB files for zImage inclusion as needed"
+    local DTBPATH=${DTSPATH/.dts/.dtb}
+    if [ -z ${CUSTOMDTSPATH} ]; then
+        if ((ARG_USB_BUILD==1)); then
+            if [ ! -s  "${DEPLOYROOT}/${BOOTMOUNT}/firmware/${DTBGREEN}" ]; then
+                cp -v "${DTBPATH}" "${DEPLOYROOT}/${BOOTMOUNT}/firmware/${DTBGREEN}"
+            fi
+        else
+           if [ ! -s  "${DEPLOYROOT}/${BOOTMOUNT}/firmware/${DTBPURPLE}" ]; then
+                cp -v "${DTBPATH}" "${DEPLOYROOT}/${BOOTMOUNT}/firmware/${DTBPURPLE}"
+           fi
+        fi
+    fi
+    if [ ! -s  "${DEPLOYROOT}/${BOOTMOUNT}/firmware/${DTBNAME}" ]; then
+        if [ -s "${DTSOLDPATH}" ]; then
+            show "Compiling dist DTB..."
+            cp -v "${DTSOLDPATH}" "${DTSPATH}"
+            make ${MAKEEXTRAS} "${DTBNAME}"
+            cp -v "${DTBPATH}" "${DEPLOYROOT}/${BOOTMOUNT}/firmware/${DTBNAME}"
+        else
+            warning "Unable to create a DTB of the original DTS because its backup is missing"
+        fi
+    fi
+    ls -1 "${FIRMWAREPATH}" | grep "\.dts$" | while read DTSFILE; do
+        SOURCEFILE=$(basename ${DTSFILE})
+        TARGETFILE=${SOURCEFILE/.dts/.dtb}
+        if [ ! -s ${DEPLOYROOT}/${BOOTMOUNT}/firmware/${TARGETFILE} ]; then
+            show "Compiling ${SOURCEFILE%.dts} DTB..."
+            cp -v "${FIRMWAREPATH}/${SOURCEFILE}" "${DTSPATH}"
+            make ${MAKEEXTRAS} "${DTBNAME}"
+            cp -v "${DTBPATH}" "${DEPLOYROOT}/${BOOTMOUNT}/firmware/${TARGETFILE}"
+        fi
+    done
+}
+display_greeting() {
+    show "Kexec kernel build script for Excito B3 miniserver, v${VERSION}"
+    if ((NATIVE_BUILD==0)); then
+        show "Cross-compiling"
+    fi
+    if ((ARG_USB_BUILD==0)); then
+        show "Creating a uImage (for hard-drive boot)"
+    else
+        show "Creating a FIT image (for USB-key boot)"
+    fi
+}
+check_if_running_in_linux_source_dir() {
+    cd ${SRCDIR}/${KERNEL}
+    if [[ ! -s ${DTSPATH} ]]; then
+        die "Please run in the top-level Linux kernel directory"
+    fi
+}
+set_boot_path_in_initramfs() {
+    if [[ ! -s ${SRCDIR}/${INITRAMFS}/init ]]; then
+        die "Please run in the top-level Linux kernel directory"
+    fi
+    if ((ARG_USB_BUILD==0)); then
+        show "Setting boot path in initramfs to /dev/sda1"
+        sed -e "/^BOOT_PATH/cBOOT_PATH=\"/dev/sda1\"" -i ${SRCDIR}/${INITRAMFS}/init
+    else
+        show "Setting boot path in initramfs to \"UUID=${UUID}\""
+        sed -e "/^BOOT_PATH/cBOOT_PATH=\"UUID=${UUID}\"" -i ${SRCDIR}/${INITRAMFS}/init
+    fi
+}
+compress_and_save() {
+    cd ${DEPLOYROOT}
+    if ((ARG_USB_BUILD==0)); then
+        show "Saving distribution folder to ${SRCDIR}/bubba-b3-preboot-${KVERSION}-sda.tar.xz"
+        tar -cJvf ${SRCDIR}/bubba-b3-preboot-${KVERSION}-sda.tar.xz *
+    else
+        show "Saving distribution folder to ${SRCDIR}/bubba-b3-preboot-${KVERSION}-usb.tar.xz"
+        tar -cJvf ${SRCDIR}/bubba-b3-preboot-${KVERSION}-usb.tar.xz *
+    fi
+    cd - &>/dev/null
+}
+
+# *************** start of script proper ***************
+process_command_line_options "${@}"
+display_greeting
+check_if_running_in_linux_source_dir
+setup_deploy_root
+set_boot_path_in_initramfs
+# perform the build
+build_kernel
+if ((ARG_USB_BUILD==0)); then
+    create_bootable_disk_image;
+else
+    create_bootable_usb_image;
+fi
+create_alternate_dtbs
+compress_and_save
+display_final_status
+cleanup_and_exit_with_code 0
+
