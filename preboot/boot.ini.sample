@@ -3,7 +3,7 @@
 # discovered it is advised that you use PARTUUIDs if you have multiple
 # (external) disks or other storage media attached.
 # to find the PARTUUID for your disk you can use `blkid`
-#ROOT="/dev/sda3"
+#ROOT="PARTUUID=05A8FC63-03"
 
 # specify the root file system type (default: ext4)
 #ROOTFS="ext4"
