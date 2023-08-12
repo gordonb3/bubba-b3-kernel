@@ -87,9 +87,9 @@ rm -f *.dtb
 cp -a ../../Module.symvers .
 readonly KVERSION=$(pwd -P | awk -F/ '{print $(NF-2)}' | sed "s/^linux\-//")
 ls -1 | grep -v "${KVERSION}" | while read file; do
-    mv ${file} "${file}-${KVERSION}-b3"
+    mv ${file} "${file}-${KVERSION}"
 done
-mv zImage* "vmlinuz-${KVERSION}-b3" 2>/dev/null
+mv zImage* "vmlinuz-${KVERSION}" 2>/dev/null
 cd - >/dev/null
 
 cd linux/deploy_root/lib/modules/*/ || exit 1
